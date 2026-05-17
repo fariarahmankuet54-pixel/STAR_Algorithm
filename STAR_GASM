@@ -1,0 +1,260 @@
+clear; clc; close all;
+funcFolder = '/Users/fariarahman/Documents/MATLAB/ASI/Codes/sakib_codes/functions';
+if exist(funcFolder,'dir')
+    addpath(funcFolder);
+else
+    error('Functions folder not found: %s', funcFolder);
+end
+%% ================= USER PARAMETERS =================
+c0 = 1540;
+f0 = 7.6e6;
+pitch = 0.3e-3;
+Ne = 128;
+
+z_focus = 30e-3;
+numBeams = 5;
+delta_d = 2.0e-3;          % beam spacing, change if needed
+
+fs = 120e6;
+dt = 1/fs;
+
+Nx = 1024;
+Nt = 1024;
+Nt = 4096;   % was 1024
+% 4096/120MHz = 34.1µs >> 19.5µs travel time ✓
+dx = pitch/2;
+
+maxIter = 100;
+figsaveFolder='/Users/fariarahman/Documents/MATLAB/ASI/STAR/figures_star_GASM/17thMay/increasedNT';
+if ~exist(figsaveFolder,'dir');mkdir(figsaveFolder);end
+
+%% ================= GRID =================
+x = ((1:Nx)-(Nx+1)/2)*dx;
+t = (0:Nt-1)*dt;
+
+x_elem = ((1:Ne)-(Ne+1)/2)*pitch;
+focus_x = ((1:numBeams)-(numBeams+1)/2)*delta_d;
+
+%% ================= TARGET 5-BEAM PATTERN =================
+target = zeros(1,Nx);
+sigma = delta_d/6;
+
+for k = 1:numBeams
+    target = target + exp(-(x-focus_x(k)).^2/(2*sigma^2));
+end
+
+target = target ./ max(target);
+
+%% ================= SINGLE-CYCLE PULSE =================
+pulse = sin(2*pi*f0*t);
+pulse(t > 1/f0) = 0;
+pulse_len = sum(t <= 1/f0);
+fig=figure
+plot(t*1e6, pulse, 'LineWidth',2)
+
+xlabel('Time [microseconds]')
+ylabel('Amplitude')
+title('Sampled single-cycle pulse')
+save_fig(fig, figsaveFolder,'Sampled single-cycle pulse');
+
+%% ================= INITIAL TX SIGNALS =================
+p_tx = zeros(Nx,Nt);
+
+for e = 1:Ne
+    [~, ix] = min(abs(x - x_elem(e)));
+    p_tx(ix,1:pulse_len) = pulse(1:pulse_len);
+end
+
+%% ================= STAR ITERATION =================
+best_uniformity = inf;
+best_tx = p_tx;
+best_peak_index = zeros(1,Ne);
+
+corr_history = zeros(maxIter,1);
+uniformity_history = zeros(maxIter,1);
+
+for iter = 1:maxIter
+
+    % Forward propagation to target depth
+    p_focal = GASM_1D(p_tx, dx, dt, z_focus, c0);
+
+    % Output pressure pattern
+    output = max(abs(real(p_focal)),[],2).';
+    output = output ./ max(output + eps);
+
+    % Correlation
+    corr_history(iter) = corr2(target, output);
+
+    % Peak uniformity
+    peak_vals = zeros(1,numBeams);
+    for k = 1:numBeams
+        [~, ix] = min(abs(x-focus_x(k)));
+        win = max(1,ix-8):min(Nx,ix+8);
+        peak_vals(k) = max(output(win));
+    end
+
+    uniformity_history(iter) = std(peak_vals)/(mean(peak_vals)+eps);
+
+    fprintf('Iter %02d | Corr = %.3f | Uniformity = %.3f\n', ...
+        iter, corr_history(iter), uniformity_history(iter));
+
+    % Save best iteration
+    if uniformity_history(iter) < best_uniformity
+        best_uniformity = uniformity_history(iter);
+        best_tx = p_tx;
+    end
+
+    %% Focal plane constraint
+    peak_each_x = max(abs(p_focal),[],2) + eps;
+    scale = target(:) ./ peak_each_x;
+    p_focal_constrained = p_focal .* scale;
+
+    %% Back propagation
+    p_back = GASM_1D(p_focal_constrained, dx, dt, -z_focus, c0);
+
+    %% Transducer plane constraint: single-cycle pulse + updated delay
+    p_tx_new = zeros(Nx,Nt);
+    peak_index = zeros(1,Ne);
+
+    for e = 1:Ne
+        [~, ix] = min(abs(x - x_elem(e)));
+
+        sig = real(p_back(ix,:));
+        [~, pk] = max(abs(sig));
+        peak_index(e) = pk;
+    end
+
+    % convert peak locations to relative delays
+    peak_index = peak_index - min(peak_index) + 1;
+
+    for e = 1:Ne
+        [~, ix] = min(abs(x - x_elem(e)));
+
+        start_idx = peak_index(e);
+        stop_idx = min(Nt, start_idx + pulse_len - 1);
+
+        L = stop_idx - start_idx + 1;
+
+        if L > 0
+            p_tx_new(ix,start_idx:stop_idx) = pulse(1:L);
+        end
+    end
+
+    p_tx = p_tx_new;
+    best_peak_index = peak_index;
+end
+
+%% ================= EXTRACT STAR DELAYS =================
+% Delay in seconds
+delay_sec = (best_peak_index - min(best_peak_index))*dt;
+
+% Delay in microseconds
+delay_us = delay_sec * 1e6;
+
+% Delay in wavelengths for Verasonics
+% Trans.frequency is in MHz, so us * MHz = wavelengths
+delay_wls = delay_us * (f0/1e6);
+
+% Apodization
+apod_STAR = ones(1,Ne);
+
+%% ================= SIMULATE X-Z PRESSURE FIELD =================
+z_list = linspace(5e-3,45e-3,220);
+pressure_xz = zeros(length(z_list),Nx);
+
+for iz = 1:length(z_list)
+    pz = GASM_1D(best_tx, dx, dt, z_list(iz), c0);
+    pressure_xz(iz,:) = max(abs(real(pz)),[],2);
+end
+
+pressure_xz = pressure_xz ./ max(pressure_xz(:));
+
+%% ================= PLOTS =================
+fig=figure;
+imagesc(x*1e3, z_list*1e3, 20*log10(pressure_xz + 1e-6));
+%set(gca,'YDir','normal');
+xlabel('x [mm]');
+ylabel('z [mm]');
+title('STAR simulated pressure field: 5 beams 30mm');
+colorbar;
+caxis([-40 0]);
+save_fig(fig, figsaveFolder, 'STAR_simulated_pressure_field_GASM_1705');
+
+[~, izf] = min(abs(z_list-z_focus));
+
+fig=figure;
+plot(x*1e3, target, 'k--', 'LineWidth', 2); hold on;
+plot(x*1e3, pressure_xz(izf,:), 'b', 'LineWidth', 2);
+xlabel('x [mm]');
+ylabel('Normalized pressure');
+title('Target vs STAR output at 30 mm');
+legend('Target', 'STAR');
+grid on;
+xlim([-5 5]);
+save_fig(fig, figsaveFolder, 'Target_vs_star_output');
+
+
+fig=figure;
+plot(delay_us, 'LineWidth', 2);
+xlabel('Element number');
+ylabel('Delay [\mus]');
+title('STAR delay for Vantage');
+grid on;
+save_fig(fig, figsaveFolder, 'STAR_delay_for_Vantage');
+
+
+fig=figure;
+plot(corr_history, 'LineWidth', 2); hold on;
+plot(uniformity_history, 'LineWidth', 2);
+xlabel('Iteration');
+ylabel('Metric');
+legend('Correlation','Peak uniformity');
+title('STAR convergence');
+grid on;
+save_fig(fig, figsaveFolder, 'STAR_convergence');
+
+%% ================= SAVE OUTPUTS =================
+save('STAR_ASI_5beam_7p6MHz_30mm_delays.mat', ...
+    'delay_us','delay_wls','apod_STAR','pressure_xz','x','z_list', ...
+    'target','focus_x','f0','pitch','z_focus','delta_d');
+
+fprintf('\nSaved: STAR_ASI_5beam_7p6MHz_30mm_delays.mat\n');
+
+%% ================= HOW TO USE IN VERASONICS =================
+% In your Vantage TX structure:
+%
+% TX(p).Apod  = apod_STAR;
+% TX(p).Delay = delay_wls;
+%
+% If your code uses delay in us instead:
+% TX(p).Delay = delay_us;
+
+%% ================= GASM FUNCTION =================
+function p_out = GASM_1D(p_in, dx, dt, dz, c0)
+
+[Nx,Nt] = size(p_in);
+
+kx = 2*pi*(-Nx/2:Nx/2-1)/(Nx*dx);
+f  = (-Nt/2:Nt/2-1)/(Nt*dt);
+
+[KX,F] = ndgrid(kx,f);
+
+omega = 2*pi*F;
+k = omega ./ c0;
+
+kz_sq = k.^2 - KX.^2;
+
+H = zeros(size(kz_sq));
+
+prop = kz_sq >= 0;
+evan = kz_sq < 0;
+
+H(prop) = exp(-1i * dz .* sign(F(prop)) .* sqrt(kz_sq(prop)));
+H(evan) = exp(-abs(dz) .* sqrt(abs(kz_sq(evan))));
+
+P = fftshift(fft2(p_in));
+P2 = P .* H;
+
+p_out = real(ifft2(ifftshift(P2)));
+
+end
